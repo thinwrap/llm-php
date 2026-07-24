@@ -1,0 +1,136 @@
+name: Publish to Packagist
+
+# Packagist publish + cosign-signed GitHub Release artifact.
+#
+# Unlike npm OIDC trusted publishing, Packagist does NOT pull from a publish
+# workflow. Packagist auto-discovers new tags via a GitHub-integration webhook
+# configured on the maintainer's Packagist account. The package itself must be
+# submitted once at packagist.org/packages/submit (a one-time manual step that
+# creates `thinwrap/llm` from composer.json); thereafter the webhook indexes
+# each published tag automatically.
+#
+# This workflow therefore does NOT push to a package registry. Instead it:
+#   1. Verifies the tag matches `v*` (the trigger is `release: published`).
+#   2. Signs the release source archive via cosign keyless OIDC (no static
+#      key) for attestable provenance — PHP analogue of npm Sigstore
+#      provenance.
+#   3. Attaches the cosign signature + certificate as Release assets so
+#      consumers can run `cosign verify-blob` post-install.
+#
+# Trigger: `release: types: [published]` only — prevents accidental publishes
+# from feature branches. By convention GitHub Releases are cut from tags on
+# `main`.
+#
+# `id-token: write` is required for the cosign keyless OIDC token exchange
+# with sigstore. No PACKAGIST_TOKEN secret is consumed — long-lived Packagist
+# API tokens are forbidden by policy (the webhook handles discovery instead).
+#
+# Two-factor authentication on the GitHub + Packagist maintainer accounts is a manual
+# precondition — it cannot be enforced in YAML.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write       # required to attach cosign signature as release asset
+  id-token: write       # required for cosign keyless OIDC token exchange
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cosign-sign-and-attach:
+    name: Cosign-sign release archive and attach to GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Verify tag matches v* pattern
+        # Defence-in-depth: even though the workflow only triggers on
+        # `release: published`, confirm the tag itself looks like a semver
+        # release tag before signing. Prevents accidental signing of
+        # `nightly-*` or `rc-*` tagged releases that should not ship to
+        # Packagist.
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag '$tag' does not match v<major>.<minor>.<patch>; refusing to sign."
+            exit 1
+          fi
+          echo "Signing release for tag: $tag"
+
+      - name: Download release source archive
+        # GitHub auto-generates a `.tar.gz` source archive for every release
+        # tag. We sign that archive (the same artifact consumers could download
+        # from the Release page); Packagist itself fetches from the tag, not
+        # from this archive, but consumers who want offline provenance
+        # verification can grab archive + cosign.sig + cosign.pem from the
+        # Release page and run cosign verify-blob.
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          repo="${{ github.repository }}"
+          curl -sSL -o "source-${tag}.tar.gz" \
+            "https://github.com/${repo}/archive/refs/tags/${tag}.tar.gz"
+          ls -la "source-${tag}.tar.gz"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Cosign keyless sign source archive
+        # Keyless signing via GitHub Actions OIDC — no static private key
+        # stored anywhere. The signing identity is recorded as the workflow
+        # run + repo on the sigstore transparency log (Rekor); the signature
+        # certificate's SAN encodes
+        # `https://github.com/thinwrap/llm-php/.github/workflows/release.yml@<sha>`.
+        #
+        # Verification recipe (consumer-side):
+        #   cosign verify-blob \
+        #     --certificate cosign.pem \
+        #     --signature cosign.sig \
+        #     --certificate-identity-regexp "https://github\.com/thinwrap/llm-php/\.github/workflows/release\.yml@.+" \
+        #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        #     source-vX.Y.Z.tar.gz
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          archive="source-${tag}.tar.gz"
+          cosign sign-blob --yes \
+            --output-signature "cosign.sig" \
+            --output-certificate "cosign.pem" \
+            "$archive"
+          ls -la cosign.sig cosign.pem
+
+      - name: Upload cosign signature + certificate to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          gh release upload "$tag" cosign.sig cosign.pem --clobber
+
+      - name: Print Packagist auto-discovery reminder
+        # Packagist auto-discovers new tags via the GitHub-integration webhook
+        # on the maintainer's Packagist account. This step prints a reminder so
+        # a release operator knows to monitor Packagist post-tag.
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          cat <<EOF
+          Cosign signature attached to release $tag.
+
+          Packagist auto-discovery should fire within minutes via the
+          GitHub-integration webhook. To verify:
+            composer show thinwrap/llm | grep versions
+            curl -sSL https://repo.packagist.org/p2/thinwrap/llm.json | jq '.packages."thinwrap/llm" | map(.version)'
+
+          If Packagist does not pick up the tag within ~5 minutes, manually
+          trigger an update via the Packagist UI ("Update" button on the
+          package page) — this is a no-op once the webhook is correctly
+          configured.
+          EOF
