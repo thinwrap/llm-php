@@ -1,7 +1,5 @@
 # thinwrap/llm
 
-> ⚠️ **Work in progress (v0).** A faithful PHP port of [`@thinwrap/llm`](https://github.com/thinwrap/llm-ts) (TypeScript): the shared OpenAI-compatible chat connector across the 15 first-class providers, plus native adapters for Anthropic, Bedrock, and Gemini, and embeddings.
-
 Unified, **SDK-free** PHP facade over LLM chat-completion & embeddings providers. One typed `Chat` facade; switch vendor by changing the provider id + model. Stateless, bring your own PSR-18 HTTP client, no vendor SDKs — the in-process, zero-egress complement to an LLM gateway.
 
 ## Install
