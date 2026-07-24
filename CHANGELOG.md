@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-07-24
+
 ### Added
 
 - Initial release of `thinwrap/llm` (PHP): a `Chat` facade (`complete` + streaming
@@ -18,3 +20,5 @@ All notable changes to this project are documented here. The format is based on
 - No vendor SDKs: bring-your-own PSR-18 client, with `php-http/discovery` as the
   only runtime dependency (auto-wires a client when none is injected); Bedrock
   SigV4 is hand-rolled on the standard library.
+
+[1.0.0]: https://github.com/thinwrap/llm-php/releases/tag/v1.0.0
