@@ -1,0 +1,7 @@
+/vendor/
+.phpunit.cache/
+.phpstan.cache/
+.php-cs-fixer.cache
+
+# macOS
+.DS_Store

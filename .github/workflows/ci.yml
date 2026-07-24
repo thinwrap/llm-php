@@ -1,0 +1,49 @@
+name: CI
+
+# PHP 8.2/8.3/8.4 (Linux). Runs the lib's own gates: PHPStan (level 8) ->
+# PHPUnit -> PHP-CS-Fixer (PER-CS dry-run). composer.lock is pinned to the
+# 8.2.0 platform floor, so resolution is identical across the matrix.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (php ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4']
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: composer:v2
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: PHPStan (level 8)
+        run: composer analyse
+
+      - name: PHPUnit
+        run: composer test
+
+      - name: PHP-CS-Fixer (PER-CS dry-run)
+        run: composer cs-check
