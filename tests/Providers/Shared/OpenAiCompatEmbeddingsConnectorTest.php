@@ -62,8 +62,8 @@ final class OpenAiCompatEmbeddingsConnectorTest extends TestCase
 
     public function testMaps429WithHttpDateRetryAfterToSeconds(): void
     {
-        // Retry-After as an HTTP-date (not a bare number) must still be parsed to
-        // seconds — same as the chat connectors (was previously dropped to null).
+        // Retry-After as an HTTP-date rather than a bare number must still resolve to
+        // seconds, matching the chat connectors.
         $future = gmdate('D, d M Y H:i:s \G\M\T', time() + 120);
         $this->mock->addResponse(new Response(
             429,

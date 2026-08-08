@@ -5,6 +5,17 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-08-08
+
+### Fixed
+
+- A PSR-18 client that throws on a non-2xx no longer collapses every provider error into
+  `provider_unavailable` with no status — for an LLM caller, a rate limit that read as an outage.
+
+### Documentation
+
+- The PSR-18 non-2xx contract is now stated in the README, not only in `.ai/`.
+
 ## [1.0.0] — 2026-07-24
 
 ### Added

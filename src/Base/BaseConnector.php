@@ -105,6 +105,17 @@ abstract class BaseConnector
         try {
             return $this->getClient()->sendRequest($request);
         } catch (ClientExceptionInterface $err) {
+            // PSR-18 requires a non-2xx to be RETURNED, not thrown, and every
+            // connector's status mapping depends on it — a rate-limited provider
+            // must read as `rate_limited`, not as an outage. A client that ignores
+            // that (Guzzle used outside its PSR-18 adapter, a decorator calling
+            // raise-on-error) still answered, so recover the response and let the
+            // connector map it. Duck-typed: no HTTP-client dependency.
+            $response = $this->recoverResponse($err);
+            if ($response !== null) {
+                return $response;
+            }
+
             // Never echo the raw message — some provider URLs carry the credential.
             throw new ConnectorError(
                 providerCode: ProviderCode::ProviderUnavailable,
@@ -112,6 +123,28 @@ abstract class BaseConnector
                 cause: ['raw' => ['exception' => $err::class], 'retryAfter' => null],
             );
         }
+    }
+
+    /**
+     * Recover the PSR-7 response a client attached to its exception, if any.
+     *
+     * Guzzle's `BadResponseException`, Symfony's `HttpExceptionInterface` and
+     * most decorators expose the answered response through `getResponse()`.
+     * Checked reflectively so no HTTP-client package becomes a dependency.
+     */
+    private function recoverResponse(\Throwable $exception): ?ResponseInterface
+    {
+        if (!method_exists($exception, 'getResponse')) {
+            return null;
+        }
+
+        try {
+            $response = $exception->getResponse();
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return $response instanceof ResponseInterface ? $response : null;
     }
 
     /**

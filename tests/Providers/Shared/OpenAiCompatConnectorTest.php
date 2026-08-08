@@ -39,6 +39,46 @@ final class OpenAiCompatConnectorTest extends TestCase
     }
 
     /**
+     * PSR-18 requires a non-2xx to be RETURNED, not thrown. A client that raises
+     * instead still answered — and for an LLM caller, a 429 misreported as an
+     * outage is the difference between backing off and failing the request.
+     */
+    public function testRaisedNon2xxIsStillMappedByTheConnector(): void
+    {
+        $throwing = new class implements \Psr\Http\Client\ClientInterface {
+            public function sendRequest(\Psr\Http\Message\RequestInterface $request): \Psr\Http\Message\ResponseInterface
+            {
+                $response = new Response(429, ['Content-Type' => 'application/json', 'Retry-After' => '20'], '{"error":{"message":"Rate limit reached"}}');
+
+                throw new class ('429 Too Many Requests', $response) extends \RuntimeException implements \Psr\Http\Client\ClientExceptionInterface {
+                    public function __construct(string $message, private readonly \Psr\Http\Message\ResponseInterface $response)
+                    {
+                        parent::__construct($message);
+                    }
+
+                    public function getResponse(): \Psr\Http\Message\ResponseInterface
+                    {
+                        return $this->response;
+                    }
+                };
+            }
+        };
+
+        $spec = Specs::get('openai');
+        self::assertNotNull($spec);
+        $connector = new OpenAiCompatConnector($spec, new OpenAiCompatConfig(apiKey: 'k'), $throwing, $this->factory, $this->factory);
+
+        try {
+            $connector->complete(new ChatInput(model: 'm', messages: [new ChatMessage(ChatRole::User, 'hi')]));
+            self::fail('expected ConnectorError');
+        } catch (ConnectorError $e) {
+            self::assertSame(429, $e->statusCode);
+            self::assertSame(ProviderCode::RateLimited, $e->providerCode);
+            self::assertStringContainsString('Rate limit reached', (string) $e->providerMessage);
+        }
+    }
+
+    /**
      * @param array<string,mixed>  $body
      * @param array<string,string> $headers
      */
