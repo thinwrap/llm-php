@@ -45,6 +45,7 @@ Create an API key at <https://console.mistral.ai/api-keys>. It is sent as `Autho
 
 - **Baseline-exception (handled):** Mistral 422s on unknown params, so the connector omits OpenAI-only extras like `stream_options`. Keep `_passthrough['body']` to known Mistral fields.
 - Model ids are date-stamped (e.g. `-YYMM`).
+- With `reasoning` set, Mistral returns `message.content` / `delta.content` as a list of `thinking` and `text` chunks; `content` / `contentDelta` carry only the `text` chunks — the reasoning trace stays on `raw`.
 
 ## Embeddings
 
@@ -61,7 +62,7 @@ $res = $emb->create(new EmbeddingsInput(model: 'mistral-embed', input: ['hello',
 // $res->embeddings — list<list<float>>, one vector per input in input order
 ```
 
-`POST https://api.mistral.ai/v1/embeddings` with `encoding_format: "float"`. `dimensions` maps to `dimensions` when set. Vectors are returned in input order on `$res->embeddings`.
+`POST https://api.mistral.ai/v1/embeddings` with `encoding_format: "float"`. `dimensions` is sent as Mistral's `output_dimension` when set. Vectors are returned in input order on `$res->embeddings`.
 
 ## Error mapping & passthrough
 

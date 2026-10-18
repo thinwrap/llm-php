@@ -46,6 +46,7 @@ Create an API key at <https://openrouter.ai/keys>. It is sent as `Authorization:
 - Aggregator: model ids are `{provider}/{model}` (e.g. `anthropic/claude-sonnet-4.5`), with optional `:free`/`:nitro`/`:floor` suffixes.
 - Pass `HTTP-Referer` / `X-Title` via `headers` for app attribution.
 - Drops params an underlying provider lacks (unless `provider.require_parameters` is set via `_passthrough`); `n` is unsupported.
+- A failure after generation started comes back as **HTTP 200** — a body with only an `error` object, or `choices[0].finish_reason: "error"` with `choices[0].error`. Both throw `ConnectorError`. Its `providerCode` is classified from the embedded `error.code` (a numeric code as if it were that HTTP status, so `{"code": 429}` → `rate_limited`; a string code or `type` by the OpenAI names, e.g. `insufficient_quota` → `rate_limited`), and an error with neither is `unknown`. `$e->statusCode` stays the `200` the response arrived with. Partial content stays on `$e->cause['raw']`.
 
 ## Embeddings
 

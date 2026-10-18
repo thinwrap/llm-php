@@ -44,8 +44,10 @@ Create an API key at <https://platform.openai.com/api-keys>. It is sent verbatim
 ### Notes / quirks
 
 - The reference provider — its Chat Completions shape is the canonical facade shape.
-- Reasoning models (o-series / GPT-5-class) reject `temperature`/`top_p`/penalties with a hard **HTTP 400** and require `max_completion_tokens` — guard by model family; don't blanket-pass sampling knobs.
-- OpenAI also ships the newer **Responses API**; this connector targets Chat Completions (D1).
+- `maxOutputTokens` is sent as `max_completion_tokens` (OpenAI deprecates `max_tokens`, and o-series / GPT-5-class models reject it); the cap includes reasoning tokens.
+- Reasoning models (o-series / GPT-5-class) reject `temperature`/`top_p`/penalties with a hard **HTTP 400** — guard by model family; don't blanket-pass sampling knobs.
+- **Function tools with reasoning on current models.** On Chat Completions, gpt-5.4, gpt-5.4-mini, gpt-5.5 and the gpt-5.6 models reject function `tools` combined with reasoning with a 400 (`invalid_request`); gpt-5.6 does so even with `reasoning` unset, because it reasons by default. The workaround is to turn reasoning off for tool calls: `_passthrough: ['body' => ['reasoning_effort' => 'none']]` (accepted on 5.4 and later; gpt-5-mini and o4-mini reject `'none'`).
+- OpenAI also ships the newer **Responses API**; this connector targets Chat Completions. Moving to the Responses API is planned.
 
 ## Embeddings
 

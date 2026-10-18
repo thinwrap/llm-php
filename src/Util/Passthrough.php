@@ -18,7 +18,7 @@ final class Passthrough
      *
      * @return array{body:array<string,mixed>,headers:array<string,string>,query:array<string,string>}
      */
-    public static function merge(array $base, ?array $passthrough): array
+    public static function merge(#[\SensitiveParameter] array $base, #[\SensitiveParameter] ?array $passthrough): array
     {
         $body = $base['body'] ?? [];
         $headers = $base['headers'] ?? [];

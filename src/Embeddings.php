@@ -33,6 +33,7 @@ final class Embeddings implements EmbeddingsConnectorInterface
 
     public function __construct(
         public readonly ?LlmProviderId $providerId,
+        #[\SensitiveParameter]
         ?OpenAiCompatConfig $config = null,
         ?ClientInterface $client = null,
         ?RequestFactoryInterface $requestFactory = null,

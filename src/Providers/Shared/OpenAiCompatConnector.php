@@ -28,6 +28,7 @@ use Thinwrap\Llm\Enum\FinishReason;
 use Thinwrap\Llm\Enum\ProviderCode;
 use Thinwrap\Llm\Exception\ConnectorError;
 use Thinwrap\Llm\Util\Passthrough;
+use Thinwrap\Llm\Util\RedactsSecrets;
 
 /**
  * One connector for every OpenAI-compatible provider, parameterized by a
@@ -35,11 +36,14 @@ use Thinwrap\Llm\Util\Passthrough;
  */
 final class OpenAiCompatConnector extends BaseConnector implements ChatConnectorInterface
 {
+    use RedactsSecrets;
+
     private readonly string $id;
     private readonly string $baseUrl;
 
     public function __construct(
         private readonly OpenAiCompatSpec $spec,
+        #[\SensitiveParameter]
         private readonly OpenAiCompatConfig $config,
         ?ClientInterface $client = null,
         ?RequestFactoryInterface $requestFactory = null,
@@ -75,7 +79,36 @@ final class OpenAiCompatConnector extends BaseConnector implements ChatConnector
             throw $this->mapVendorError($status, $body, $response);
         }
 
-        return $this->parseResult($this->requireDecodedBody($body, $status), $input->model);
+        $json = $this->requireDecodedBody($body, $status);
+        $this->guardSuccessBody($json, $status);
+
+        return $this->parseResult($json, $input->model);
+    }
+
+    /**
+     * OpenRouter (and other gateways) report a failure that happens after
+     * processing started as HTTP 200: either a body holding only an `error`
+     * object, or `choices[0]` with `finish_reason: "error"` and its own `error`
+     * next to partial content. Parsing either as a completion would hand the
+     * caller empty or truncated output as success.
+     *
+     * @param array<mixed> $json
+     */
+    private function guardSuccessBody(array $json, int $status): void
+    {
+        if (($json['error'] ?? null) !== null) {
+            throw $this->inBodyError($json, $json, $status);
+        }
+
+        $choices = $json['choices'] ?? null;
+        if (!is_array($choices) || $choices === [] || !array_is_list($choices)) {
+            throw $this->missingPayloadError('choices', $json, $status);
+        }
+
+        $first = $choices[0];
+        if (is_array($first) && (($first['error'] ?? null) !== null || ($first['finish_reason'] ?? null) === 'error')) {
+            throw $this->inBodyError(['error' => $first['error'] ?? null], $json, $status);
+        }
     }
 
     public function stream(ChatInput $input): \Generator
@@ -89,10 +122,21 @@ final class OpenAiCompatConnector extends BaseConnector implements ChatConnector
             throw $this->mapVendorError($status, $this->decodeJson($response), $response);
         }
 
-        foreach ($this->parseSSEStream($response->getBody()) as $chunk) {
-            foreach ($this->mapStreamChunk($chunk) as $delta) {
+        $this->requireEventStream($response);
+        // A complete stream ends on `[DONE]`, and its last choice chunk carries a
+        // `finish_reason`; either one proves the answer was not cut off.
+        $sawFinish = false;
+        $events = $this->parseSSEStream($response->getBody());
+        foreach ($events as $chunk) {
+            foreach ($this->mapStreamChunk($chunk, $status) as $delta) {
+                if ($delta->finishReason !== null) {
+                    $sawFinish = true;
+                }
                 yield $delta;
             }
+        }
+        if (!$events->getReturn() && !$sawFinish) {
+            throw $this->streamEndedEarlyError();
         }
     }
 
@@ -154,10 +198,7 @@ final class OpenAiCompatConnector extends BaseConnector implements ChatConnector
             $input->_passthrough,
         );
 
-        $url = $this->baseUrl . '/chat/completions';
-        if ($merged['query'] !== []) {
-            $url .= '?' . http_build_query($merged['query']);
-        }
+        $url = self::appendQuery($this->baseUrl . '/chat/completions', $merged['query']);
 
         return ['url' => $url, 'body' => $merged['body'], 'headers' => $merged['headers']];
     }
@@ -256,7 +297,7 @@ final class OpenAiCompatConnector extends BaseConnector implements ChatConnector
 
         return new ChatResult(
             message: new AssistantMessage(
-                content: is_string($content) ? $content : null,
+                content: self::contentText($content),
                 toolCalls: $toolCalls,
             ),
             finishReason: $this->mapFinishReason(is_string($finish) ? $finish : null),
@@ -264,6 +305,31 @@ final class OpenAiCompatConnector extends BaseConnector implements ChatConnector
             model: is_string($model) ? $model : $requestedModel,
             raw: $json,
         );
+    }
+
+    /**
+     * Mistral reasoning models return `content` / `delta.content` as a list of
+     * typed chunks rather than a string: `thinking` chunks carry the reasoning
+     * trace, `text` chunks the answer. Only the answer is content — the trace
+     * stays reachable on `raw`.
+     */
+    private static function contentText(mixed $content): ?string
+    {
+        if (is_string($content)) {
+            return $content;
+        }
+        if (!is_array($content)) {
+            return null;
+        }
+
+        $text = '';
+        foreach ($content as $chunk) {
+            if (is_array($chunk) && ($chunk['type'] ?? null) === 'text' && is_string($chunk['text'] ?? null)) {
+                $text .= $chunk['text'];
+            }
+        }
+
+        return $text !== '' ? $text : null;
     }
 
     private function mapToolCall(mixed $tc): ToolCall
@@ -309,13 +375,13 @@ final class OpenAiCompatConnector extends BaseConnector implements ChatConnector
      *
      * @return list<ChatStreamDelta>
      */
-    private function mapStreamChunk(array $chunk): array
+    private function mapStreamChunk(array $chunk, int $status): array
     {
         // A provider/gateway failure emitted mid-stream arrives as an `{"error": …}`
         // data frame (no `choices`). Surface it as a ConnectorError instead of
         // silently truncating the stream into a finish-less "success".
         if (($chunk['error'] ?? null) !== null) {
-            throw $this->streamError($chunk);
+            throw $this->inBodyError($chunk, $chunk, $status);
         }
 
         $choice = (is_array($chunk['choices'] ?? null) ? ($chunk['choices'][0] ?? null) : null);
@@ -324,8 +390,8 @@ final class OpenAiCompatConnector extends BaseConnector implements ChatConnector
 
         $deltas = [];
 
-        $content = $delta['content'] ?? null;
-        if (is_string($content) && $content !== '') {
+        $content = self::contentText($delta['content'] ?? null);
+        if ($content !== null && $content !== '') {
             $deltas[] = new ChatStreamDelta(contentDelta: $content, raw: $chunk);
         }
 
@@ -383,32 +449,26 @@ final class OpenAiCompatConnector extends BaseConnector implements ChatConnector
     }
 
     /**
-     * Builds a ConnectorError from an `{"error": …}` frame emitted mid-stream,
-     * reusing the non-stream error mapping.
+     * Builds a ConnectorError from an error reported inside a 2xx body or a
+     * mid-stream SSE frame. The code comes from the error's own `code` / `type`
+     * (see {@see EmbeddedErrorStatus}), classified as that HTTP status would be;
+     * `statusCode` stays the status the response arrived with, since no other was
+     * ever sent. An error naming neither is `unknown`.
      *
-     * @param array<mixed> $chunk
+     * @param array<mixed> $errorView array whose `error` key holds the vendor error
+     * @param array<mixed> $raw       the full body/frame, kept on `cause['raw']`
      */
-    private function streamError(array $chunk): ConnectorError
+    private function inBodyError(array $errorView, array $raw, int $arrivalStatus): ConnectorError
     {
-        $status = $this->streamErrorStatus($chunk['error'] ?? null);
-        $message = $this->extractErrorMessage($chunk) ?? "HTTP {$status}";
+        $status = EmbeddedErrorStatus::of($errorView['error'] ?? null);
+        $message = $this->extractErrorMessage($errorView) ?? 'Provider reported an error';
 
         return new ConnectorError(
-            providerCode: $this->mapStatusToProviderCode($status, $chunk),
+            providerCode: $status === null ? ProviderCode::Unknown : $this->mapStatusToProviderCode($status, $errorView),
             providerMessage: $message,
-            cause: ['raw' => $chunk, 'retryAfter' => null],
-            statusCode: $status,
+            cause: ['raw' => $raw, 'retryAfter' => null],
+            statusCode: $arrivalStatus,
         );
-    }
-
-    /** Best-effort HTTP status for a mid-stream `{"error": …}` frame (some gateways carry a numeric `code`). */
-    private function streamErrorStatus(mixed $error): int
-    {
-        if (is_array($error) && is_int($error['code'] ?? null) && $error['code'] >= 400 && $error['code'] <= 599) {
-            return $error['code'];
-        }
-
-        return 500;
     }
 
     /**
@@ -466,24 +526,38 @@ final class OpenAiCompatConnector extends BaseConnector implements ChatConnector
         if ($status === 401 || $status === 403) {
             return ProviderCode::AuthFailed;
         }
-        if ($status === 429) {
+        // 402 is exhausted credit or quota, which OpenAI (429 insufficient_quota)
+        // and Gemini (RESOURCE_EXHAUSTED) already report as rate limiting.
+        if ($status === 429 || $status === 402) {
             return ProviderCode::RateLimited;
         }
-        if ($status >= 500) {
+        // 408 is a timeout, which a retry can clear.
+        if ($status >= 500 || $status === 408) {
             return ProviderCode::ProviderUnavailable;
         }
         if ($status === 400 || $status === 404 || $status === 422) {
+            $error = $body['error'] ?? null;
+            if (is_array($error) && ($error['code'] ?? null) === 'context_length_exceeded') {
+                return ProviderCode::ContextLengthExceeded;
+            }
             $msg = strtolower($this->extractErrorMessage($body) ?? '');
             if (str_contains($msg, 'context length') || str_contains($msg, 'maximum context') || str_contains($msg, 'context_length')) {
                 return ProviderCode::ContextLengthExceeded;
             }
-            if (str_contains($msg, 'content') && str_contains($msg, 'filter')) {
+            // OpenAI says "content_policy_violation", Azure "content_filter",
+            // others "moderation"; matched the same way in every language.
+            if (
+                (str_contains($msg, 'content') && str_contains($msg, 'filter'))
+                || str_contains($msg, 'content_policy')
+                || str_contains($msg, 'content policy')
+                || str_contains($msg, 'moderation')
+            ) {
                 return ProviderCode::ContentFiltered;
             }
 
             return ProviderCode::InvalidRequest;
         }
-        // Any other client error (402, 405, 409, 410, 413, …) is a bad request.
+        // Any other client error (405, 409, 410, 413, …) is a bad request.
         if ($status >= 400) {
             return ProviderCode::InvalidRequest;
         }

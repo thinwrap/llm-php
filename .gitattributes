@@ -1,0 +1,23 @@
+# Keep the Packagist dist (built from `git archive`) to what consumers need:
+# src/ (including the per-provider READMEs under src/Providers/), composer.json,
+# README.md, CHANGELOG.md and LICENSE. Everything below is for people working in
+# the repo.
+
+/.ai                    export-ignore
+/.github                export-ignore
+/.junie                 export-ignore
+/docs                   export-ignore
+/scripts                export-ignore
+/tests                  export-ignore
+
+/.cursorrules           export-ignore
+/.gitattributes         export-ignore
+/.gitignore             export-ignore
+/.php-cs-fixer.dist.php export-ignore
+/AGENTS.md              export-ignore
+/CLAUDE.md              export-ignore
+/GEMINI.md              export-ignore
+/composer.lock          export-ignore
+/phpstan.neon           export-ignore
+/phpstan.neon.dist      export-ignore
+/phpunit.xml.dist       export-ignore

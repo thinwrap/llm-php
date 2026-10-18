@@ -26,6 +26,7 @@ use Thinwrap\Llm\Enum\ChatRole;
 use Thinwrap\Llm\Enum\FinishReason;
 use Thinwrap\Llm\Enum\ProviderCode;
 use Thinwrap\Llm\Exception\ConnectorError;
+use Thinwrap\Llm\Util\RedactsSecrets;
 
 /**
  * Native adapter for the AWS Bedrock Converse API. Requests are signed with a
@@ -37,6 +38,8 @@ use Thinwrap\Llm\Exception\ConnectorError;
  */
 final class BedrockConnector extends BaseConnector implements ChatConnectorInterface
 {
+    use RedactsSecrets;
+
     private const SERVICE = 'bedrock';
     private const DEFAULT_MAX_TOKENS = 4096;
 
@@ -54,12 +57,23 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
     private readonly string $canonicalBasePath;
 
     public function __construct(
+        #[\SensitiveParameter]
         private readonly BedrockConfig $config,
         ?ClientInterface $client = null,
         ?RequestFactoryInterface $requestFactory = null,
         ?StreamFactoryInterface $streamFactory = null,
     ) {
         $this->id = 'bedrock';
+
+        // The region lands in the default host and in the signing scope; anything
+        // but a DNS label (`us-east-1`) could steer the signed request, session
+        // token included, to another host.
+        if (preg_match('/^[a-z0-9]+(-[a-z0-9]+)*$/', $config->region) !== 1) {
+            throw new ConnectorError(
+                providerCode: ProviderCode::InvalidRequest,
+                providerMessage: 'Bedrock: `region` must be an AWS region name such as us-east-1',
+            );
+        }
 
         $origin = rtrim($config->baseUrl ?? ('https://bedrock-runtime.' . $config->region . '.amazonaws.com'), '/');
         $host = parse_url($origin, PHP_URL_HOST);
@@ -103,17 +117,24 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
         // otherwise sign `%3A` while the server computes `%253A` → 403.
         $wirePath = '/model/' . rawurlencode($input->model) . '/converse';
         $canonicalPath = $this->canonicalBasePath . '/model/' . rawurlencode(rawurlencode($input->model)) . '/converse';
-        $headers = $this->buildSignedHeaders('POST', $canonicalPath, $serialized, $input);
+        $ptQuery = $input->_passthrough['query'] ?? null;
+        $query = self::canonicalQuery(is_array($ptQuery) ? $ptQuery : []);
+        $headers = $this->buildSignedHeaders('POST', $canonicalPath, $query, $serialized, $input);
 
-        $response = $this->sendPostJsonRaw($this->origin . $wirePath, $serialized, $headers);
+        $response = $this->sendPostJsonRaw($this->origin . $wirePath . ($query !== '' ? "?{$query}" : ''), $serialized, $headers);
 
         $status = $response->getStatusCode();
-        $json = $this->decodeJson($response);
+        [$json, $kept] = $this->decodeJsonWithObjects($response);
         if ($status < 200 || $status >= 300) {
             throw $this->mapVendorError($status, $json, $response);
         }
 
-        return $this->parseResult($this->requireDecodedBody($json, $status), $input->model);
+        $json = $this->requireDecodedBody($json, $status);
+        if (!is_array($json['output'] ?? null)) {
+            throw $this->missingPayloadError('output', $json, $status);
+        }
+
+        return $this->parseResult($json, $kept, $input->model);
     }
 
     public function stream(ChatInput $input): \Generator
@@ -174,12 +195,17 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
 
                 return ['toolSpec' => $spec];
             }, $input->tools);
-            $toolConfig = ['tools' => $tools];
-            $tc = $this->mapToolChoice($input->toolChoice);
-            if ($tc !== null) {
-                $toolConfig['toolChoice'] = $tc;
+            // Converse's toolChoice has no `none`: the only way to forbid tool use is
+            // to send no tools. Bedrock still demands a toolConfig when the history
+            // holds toolUse/toolResult blocks — that 400 passes through.
+            if ($input->toolChoice !== 'none') {
+                $toolConfig = ['tools' => $tools];
+                $tc = $this->mapToolChoice($input->toolChoice);
+                if ($tc !== null) {
+                    $toolConfig['toolChoice'] = $tc;
+                }
+                $body['toolConfig'] = $toolConfig;
             }
-            $body['toolConfig'] = $toolConfig;
         }
 
         $ptBody = $input->_passthrough['body'] ?? null;
@@ -260,7 +286,8 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
             }
         } elseif (is_array($content)) {
             foreach ($content as $p) {
-                if ($p instanceof TextPart) {
+                // Converse rejects an empty text block.
+                if ($p instanceof TextPart && $p->text !== '') {
                     $blocks[] = ['text' => $p->text];
                 } elseif ($p instanceof ImagePart) {
                     $blocks[] = ['image' => ['format' => $this->imageFormat($p->mediaType), 'source' => ['bytes' => $p->base64]]];
@@ -345,9 +372,10 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
     }
 
     /**
-     * @param array<mixed> $json
+     * @param array<mixed>      $json plain decode: read here and kept as `raw`
+     * @param array<mixed>|null $kept the same body with objects preserved, for the arguments
      */
-    private function parseResult(array $json, string $requestedModel): ChatResult
+    private function parseResult(array $json, ?array $kept, string $requestedModel): ChatResult
     {
         $output = is_array($json['output'] ?? null) ? $json['output'] : [];
         $message = is_array($output['message'] ?? null) ? $output['message'] : [];
@@ -355,7 +383,7 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
 
         $text = '';
         $toolCalls = [];
-        foreach ($content as $b) {
+        foreach ($content as $i => $b) {
             if (!is_array($b)) {
                 continue;
             }
@@ -367,16 +395,20 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
                     id: is_string($tu['toolUseId'] ?? null) ? $tu['toolUseId'] : '',
                     function: new ToolCallFunction(
                         name: is_string($tu['name'] ?? null) ? $tu['name'] : '',
-                        arguments: $this->encodeJson($tu['input'] ?? []),
+                        arguments: $this->encodeJson(self::pick($kept, 'output', 'message', 'content', $i, 'toolUse', 'input') ?? $tu['input'] ?? []),
                     ),
                 );
             }
         }
 
         $usage = is_array($json['usage'] ?? null) ? $json['usage'] : [];
-        $in = is_int($usage['inputTokens'] ?? null) ? $usage['inputTokens'] : 0;
+        // Cache reads and writes are billed input that `inputTokens` leaves out.
+        $in = 0;
+        foreach (['inputTokens', 'cacheReadInputTokens', 'cacheWriteInputTokens'] as $key) {
+            $in += is_int($usage[$key] ?? null) ? $usage[$key] : 0;
+        }
         $out = is_int($usage['outputTokens'] ?? null) ? $usage['outputTokens'] : 0;
-        $total = is_int($usage['totalTokens'] ?? null) ? $usage['totalTokens'] : $in + $out;
+        $total = $in + $out;
         $stopReason = $json['stopReason'] ?? null;
 
         return new ChatResult(
@@ -395,9 +427,10 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
     {
         return match ($sr) {
             'end_turn', 'stop_sequence' => FinishReason::Stop,
-            'max_tokens' => FinishReason::Length,
+            'max_tokens', 'model_context_window_exceeded' => FinishReason::Length,
             'tool_use' => FinishReason::ToolCalls,
             'content_filtered', 'guardrail_intervened' => FinishReason::ContentFilter,
+            // malformed_model_output / malformed_tool_use have no normalized equivalent.
             default => FinishReason::Unknown,
         };
     }
@@ -407,7 +440,7 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
     /**
      * @return array<string,string>
      */
-    private function buildSignedHeaders(string $method, string $canonicalPath, string $serializedBody, ChatInput $input): array
+    private function buildSignedHeaders(string $method, string $canonicalPath, string $canonicalQuery, string $serializedBody, ChatInput $input): array
     {
         $extra = ['Content-Type' => 'application/json'];
         if ($this->config->headers !== null) {
@@ -418,7 +451,7 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
             $extra = array_merge($extra, $ptHeaders);
         }
 
-        $signed = $this->signAwsRequest($method, $canonicalPath, $serializedBody, $extra);
+        $signed = $this->signAwsRequest($method, $canonicalPath, $canonicalQuery, $serializedBody, $extra);
 
         // extra headers are sent AND signed; the signed set (Host/X-Amz-*/Authorization) wins on collision.
         return array_merge($extra, $signed);
@@ -429,12 +462,11 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
      *
      * @return array<string,string>
      */
-    private function signAwsRequest(string $method, string $canonicalPath, string $serializedBody, array $extraHeaders): array
+    private function signAwsRequest(string $method, string $canonicalPath, string $canonicalQuery, string $serializedBody, #[\SensitiveParameter] array $extraHeaders): array
     {
         $timestamp = gmdate('Ymd\THis\Z');
         $dateStamp = substr($timestamp, 0, 8);
         $hashedPayload = hash('sha256', $serializedBody);
-        $canonicalQuery = '';
 
         $candidate = array_merge($extraHeaders, [
             'Host' => $this->host,
@@ -489,6 +521,23 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
         }
 
         return $out;
+    }
+
+    /**
+     * SigV4 canonical query string: RFC 3986-encoded pairs sorted by key, then
+     * value. The same string goes on the wire, so what is signed is what is sent.
+     *
+     * @param array<string,mixed> $query
+     */
+    private static function canonicalQuery(#[\SensitiveParameter] array $query): string
+    {
+        $pairs = [];
+        foreach ($query as $key => $value) {
+            $pairs[] = [rawurlencode((string) $key), rawurlencode(is_scalar($value) ? (string) $value : '')];
+        }
+        usort($pairs, static fn(array $a, array $b): int => [$a[0], $a[1]] <=> [$b[0], $b[1]]);
+
+        return implode('&', array_map(static fn(array $p): string => "{$p[0]}={$p[1]}", $pairs));
     }
 
     /**
@@ -585,31 +634,38 @@ final class BedrockConnector extends BaseConnector implements ChatConnectorInter
         if ($status === 401 || $status === 403) {
             return ProviderCode::AuthFailed;
         }
-        if ($status === 429) {
+        // 402 is exhausted credit or quota, which OpenAI (429 insufficient_quota)
+        // and Gemini (RESOURCE_EXHAUSTED) already report as rate limiting.
+        if ($status === 429 || $status === 402) {
             return ProviderCode::RateLimited;
         }
-        if ($status >= 500) {
+        // 408 ModelTimeoutException and 424 ModelErrorException are model-side
+        // failures a retry can clear, like a 5xx.
+        if ($status >= 500 || $status === 408 || $status === 424) {
             return ProviderCode::ProviderUnavailable;
         }
-        if ($status === 400 || $status === 404 || $status === 422) {
+        if ($status === 400) {
             $m = strtolower($message);
             if (str_contains($m, 'throttl')) {
                 return ProviderCode::RateLimited;
             }
-            // Match only phrases that actually denote a context overflow. Bare
-            // 'token'/'max' substrings misclassified ordinary 400s ("invalid
-            // security token", "malformed…", "exceeds max items") as
-            // context_length_exceeded.
+            // Only phrases that name a context overflow: Bedrock's ValidationException
+            // "Input is too long for requested model." and the model provider's own
+            // wording, which Bedrock relays (Anthropic "prompt is too long" / "exceed
+            // context limit", OpenAI-style "maximum context length"). A bare
+            // 'too long' / 'token' match would catch ordinary 400s and loop
+            // history-trimming callers.
             if (
-                str_contains($m, 'too long')
-                || str_contains($m, 'too many tokens')
-                || str_contains($m, 'context length')
-                || str_contains($m, 'context window')
-                || str_contains($m, 'maximum context')
+                str_contains($m, 'input is too long')
+                || str_contains($m, 'prompt is too long')
+                || str_contains($m, 'too many input tokens')
+                || str_contains($m, 'maximum context length')
+                || str_contains($m, 'exceed context limit')
             ) {
                 return ProviderCode::ContextLengthExceeded;
             }
-
+        }
+        if ($status >= 400) {
             return ProviderCode::InvalidRequest;
         }
 

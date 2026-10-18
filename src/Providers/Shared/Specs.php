@@ -23,15 +23,17 @@ final class Specs
         }
 
         $s = [];
-        $s['openai'] = new OpenAiCompatSpec(id: 'openai', defaultBaseUrl: 'https://api.openai.com/v1');
-        $s['azure-openai'] = new OpenAiCompatSpec(id: 'azure-openai', defaultBaseUrl: null, authHeaderName: 'api-key', authHeaderPrefix: '');
+        // OpenAI deprecates `max_tokens` in favour of `max_completion_tokens` and o-series /
+        // GPT-5-class models reject it; Azure reasoning deployments accept only the latter.
+        $s['openai'] = new OpenAiCompatSpec(id: 'openai', defaultBaseUrl: 'https://api.openai.com/v1', maxTokensField: 'max_completion_tokens');
+        $s['azure-openai'] = new OpenAiCompatSpec(id: 'azure-openai', defaultBaseUrl: null, authHeaderName: 'api-key', authHeaderPrefix: '', maxTokensField: 'max_completion_tokens');
         $s['openrouter'] = new OpenAiCompatSpec(id: 'openrouter', defaultBaseUrl: 'https://openrouter.ai/api/v1');
         $s['groq'] = new OpenAiCompatSpec(id: 'groq', defaultBaseUrl: 'https://api.groq.com/openai/v1', streamUsagePath: 'x_groq');
         $s['together'] = new OpenAiCompatSpec(id: 'together', defaultBaseUrl: 'https://api.together.ai/v1');
         $s['fireworks'] = new OpenAiCompatSpec(id: 'fireworks', defaultBaseUrl: 'https://api.fireworks.ai/inference/v1');
         $s['deepseek'] = new OpenAiCompatSpec(id: 'deepseek', defaultBaseUrl: 'https://api.deepseek.com/v1');
         $s['xai'] = new OpenAiCompatSpec(id: 'xai', defaultBaseUrl: 'https://api.x.ai/v1');
-        $s['mistral'] = new OpenAiCompatSpec(id: 'mistral', defaultBaseUrl: 'https://api.mistral.ai/v1', strictParams: true);
+        $s['mistral'] = new OpenAiCompatSpec(id: 'mistral', defaultBaseUrl: 'https://api.mistral.ai/v1', strictParams: true, dimensionsField: 'output_dimension');
         $s['perplexity'] = new OpenAiCompatSpec(id: 'perplexity', defaultBaseUrl: 'https://api.perplexity.ai', supportsTools: false);
         $s['deepinfra'] = new OpenAiCompatSpec(id: 'deepinfra', defaultBaseUrl: 'https://api.deepinfra.com/v1/openai');
         $s['cloudflare'] = new OpenAiCompatSpec(id: 'cloudflare', defaultBaseUrl: null);

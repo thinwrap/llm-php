@@ -79,9 +79,20 @@ foreach ($chat->stream($input) as $delta) {
 ```
 
 `stream()` returns a `\Generator<ChatStreamDelta>`. It reads the provider's
-`text/event-stream` response off the PSR-7 body incrementally. Bedrock (whose
-stream uses AWS binary event-stream framing) falls back to a single Converse call
+`text/event-stream` response off the PSR-7 body as the client hands it over. Bedrock
+(whose stream uses AWS binary event-stream framing) falls back to a single Converse call
 replayed as deltas.
+
+Deltas arrive incrementally only if your PSR-18 client returns an unbuffered body.
+**Guzzle buffers by default**: its `sendRequest()` reads the whole response before
+returning, so every delta shows up at once when generation ends. Construct it with
+`stream` on and inject it:
+
+```php
+$chat = new Chat(LlmProviderId::OpenAI, $config, new \GuzzleHttp\Client(['stream' => true]));
+```
+
+With another client, check that it does not buffer the response body.
 
 ## Embeddings
 
@@ -121,11 +132,20 @@ $chat = new Chat(
 The wrapper holds no state — no cache, no connection pool, no retry buffer. For an
 already-built connector (a custom provider, say), use `Chat::fromConnector($connector)`.
 
+The wrapper sets no timeout either: configure it on your client, and leave room for
+reasoning models, whose non-stream calls can run for minutes.
+
 ## `_passthrough` escape valve
 
 When the normalized input doesn't expose a vendor-specific field, forward arbitrary
-keys via `_passthrough` on the input DTO. The connector deep-merges `body`, and merges
-`headers` / `query`; consumer values win on collision. Keys are forwarded verbatim.
+keys via `_passthrough` on the input DTO. Every connector merges `body`, `headers` and
+`query` (Bedrock signs the query too); consumer values win on collision. Keys are
+forwarded verbatim.
+
+The `body` merge is **shallow**: a top-level passthrough key replaces the connector's
+value whole. Passing `generationConfig` to Gemini, for example, replaces the one the
+connector built from `maxOutputTokens` / `temperature` / `responseFormat`, so restate
+any of those you still want inside it.
 
 ```php
 new ChatInput(
@@ -135,13 +155,62 @@ new ChatInput(
 );
 ```
 
+## Carrying provider state between turns (`providerMetadata`)
+
+Some providers need parts of their response sent back on the next request: Gemini's
+`thoughtSignature` on each function call, and Anthropic's thinking blocks in a tool
+loop. `ToolCall`, `ChatMessage`, `AssistantMessage`, `ToolCallDelta` and the terminal
+`ChatStreamDelta` carry them in an optional `providerMetadata` array keyed by provider
+id. Treat it as opaque. When you build the next request from a result, copy
+`providerMetadata` along with `content` and `toolCalls`:
+
+```php
+$turn = $res->message;
+$messages[] = new ChatMessage(
+    ChatRole::Assistant,
+    $turn->content,
+    toolCalls: $turn->toolCalls,               // each ToolCall keeps its own metadata
+    providerMetadata: $turn->providerMetadata,
+);
+```
+
+A connector reads only its own key and never sends another provider's, so a history
+survives a provider switch. Losing the metadata costs Anthropic its earlier reasoning;
+Gemini falls back to Google's documented signature bypass, so the tool loop still runs.
+
+## Usage
+
+`inputTokens` counts every billed input token (Anthropic and Bedrock cache reads and
+writes, Gemini tool-use prompt tokens included) and `outputTokens` every billed output
+token (Gemini thoughts included). `totalTokens` is their sum on Anthropic, Bedrock and
+Gemini, and the provider's reported total on the OpenAI-compatible providers.
+
 ## Error handling
 
 Every failure surfaces as `ConnectorError` with a typed `ProviderCode`
 (`rate_limited`, `auth_failed`, `provider_unavailable`, `invalid_request`,
 `context_length_exceeded`, `content_filtered`, `unknown`). There is **no** top-level
 `retryAfterSeconds` field — the raw `Retry-After` and its parsed seconds ride in
-`$e->cause`. The wrapper performs no automatic retry.
+`$e->cause`. The wrapper performs no automatic retry. `retryAfterSeconds` is set only
+for an RFC 9110 value: whole seconds, or an HTTP-date (0 once it has passed); anything
+else (`1.5`, `tomorrow`) leaves it `null`.
+
+`408` reads as `provider_unavailable` (a timeout a retry can clear), `402` and `429` as
+`rate_limited`, every other `4xx` as `invalid_request` unless a more specific rule
+matches, and every `5xx` as `provider_unavailable`.
+
+A stream that comes back as anything but `text/event-stream`, or that ends before the
+provider's terminal event (a dropped connection, a proxy timeout), throws
+`provider_unavailable` rather than ending as a short answer.
+
+A 2xx is not automatically a success: a body that carries an `error` object (OpenRouter
+reports failures after generation started this way), lacks the result payload
+(`choices`, `content`, `output`, `candidates`, `data`), or returns the wrong number of
+embeddings / a non-numeric vector cell also throws `ConnectorError`, with the body on
+`$e->cause['raw']`. An error reported inside a 2xx body or a mid-stream frame keeps the
+status the response arrived with as `$e->statusCode` (normally `200`); its
+`providerCode` comes from the error's own code or type, and is `unknown` when it has
+neither.
 
 ## Security
 
@@ -149,6 +218,13 @@ Report vulnerabilities **privately** — please do not open a public issue. Pref
 [private security advisory](https://github.com/thinwrap/llm-php/security/advisories/new)
 on this repository. Alternatively, email **security@thinwrap.dev**. Include the affected
 versions and a minimal reproduction if you have one.
+
+Credentials stay out of what the wrapper itself can leak: config and connector
+parameters are `#[\SensitiveParameter]` (out of stack traces), `print_r()` / `var_dump()`
+of a config, connector or facade shows `[redacted]` (`var_export()` does not consult
+`__debugInfo()` and still prints them), and a header value containing CR, LF or NUL —
+an API key pasted with a trailing newline — is rejected with `invalid_request` before
+any request is built, whichever PSR-7 library you use.
 
 A vulnerability in a *provider's* own API or service belongs to that vendor rather than
 to this wrapper — please report those upstream.

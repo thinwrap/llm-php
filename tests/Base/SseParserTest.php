@@ -10,6 +10,7 @@ use Psr\Http\Message\StreamInterface;
 use Thinwrap\Llm\Base\BaseConnector;
 use Thinwrap\Llm\Enum\ProviderCode;
 use Thinwrap\Llm\Exception\ConnectorError;
+use Thinwrap\Llm\Tests\Support\ChunkedStream;
 
 /** Exposes the protected SSE parser for direct testing. */
 final class SseHarness extends BaseConnector
@@ -277,5 +278,41 @@ final class SseParserTest extends TestCase
 
         $this->assertSame([['n' => 1]], $seen);
         $this->assertTrue($stream->closed);
+    }
+
+    public function testSingleCrlfInsideAnEventIsNotABoundary(): void
+    {
+        // One event, two `data:` lines joined by a single CRLF: the payload is the
+        // lines joined with "\n". Treating that CRLF as "CR, then LF" split the
+        // event into two halves that are not JSON, and both were dropped.
+        $sse = "data: {\"a\":\r\ndata: 1}\r\n\r\ndata: {\"n\":2}\r\n\r\n";
+        $out = (new SseHarness())->drain($this->factory->createStream($sse));
+
+        $this->assertSame([['a' => 1], ['n' => 2]], $out);
+    }
+
+    public function testEventsSplitAcrossReadsAreReassembled(): void
+    {
+        $sse = "data: {\"a\":\r\ndata: 1}\r\n\r\ndata: {\"n\":2}\n\ndata: {\"n\":3}\r\rdata: [DONE]\n\n";
+        foreach ([1, 2, 3, 5, 7] as $size) {
+            $out = (new SseHarness())->drain(new ChunkedStream($sse, $size));
+            $this->assertSame([['a' => 1], ['n' => 2], ['n' => 3]], $out, "chunk size {$size}");
+        }
+    }
+
+    public function testReturnValueReportsWhetherTheStreamEndedOnDone(): void
+    {
+        $cases = [
+            "data: {\"n\":1}\n\ndata: [DONE]\n\n" => true,
+            "data: {\"n\":1}\n\ndata: [DONE]" => true,
+            "data: {\"n\":1}\n\n" => false,
+            '' => false,
+        ];
+        foreach ($cases as $sse => $expected) {
+            $gen = (new SseHarness())->open(new ChunkedStream($sse, 3));
+            foreach ($gen as $_) {
+            }
+            $this->assertSame($expected, $gen->getReturn(), json_encode($sse, JSON_THROW_ON_ERROR));
+        }
     }
 }

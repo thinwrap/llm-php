@@ -29,6 +29,7 @@ use Thinwrap\Llm\Enum\FinishReason;
 use Thinwrap\Llm\Enum\ProviderCode;
 use Thinwrap\Llm\Enum\ReasoningEffort;
 use Thinwrap\Llm\Exception\ConnectorError;
+use Thinwrap\Llm\Util\RedactsSecrets;
 
 /**
  * Native adapter for the Gemini `generateContent` API (AI Studio). The model id
@@ -36,12 +37,25 @@ use Thinwrap\Llm\Exception\ConnectorError;
  */
 final class GeminiConnector extends BaseConnector implements ChatConnectorInterface
 {
+    use RedactsSecrets;
+
     private const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
+
+    /**
+     * Google's documented stand-in for a missing thought signature. Gemini 3
+     * rejects a replayed `functionCall` turn without one (400), which is every
+     * hand-built history and every history from another provider.
+     */
+    private const SKIP_SIGNATURE = 'skip_thought_signature_validator';
+
+    /** Ids this connector invents when Gemini sends none — never echoed back as Gemini's own. */
+    private const SYNTHETIC_ID = '/^call_\d+$/';
 
     private readonly string $id;
     private readonly string $baseUrl;
 
     public function __construct(
+        #[\SensitiveParameter]
         private readonly GeminiConfig $config,
         ?ClientInterface $client = null,
         ?RequestFactoryInterface $requestFactory = null,
@@ -61,22 +75,34 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
     public function complete(ChatInput $input): ChatResult
     {
         $req = $this->buildRequest($input);
-        $url = $this->baseUrl . '/models/' . rawurlencode($input->model) . ':generateContent';
+        $url = self::appendQuery($this->baseUrl . '/models/' . rawurlencode($input->model) . ':generateContent', $req['query']);
         $response = $this->sendPostJson($url, $req['body'], $req['headers']);
 
         $status = $response->getStatusCode();
-        $body = $this->decodeJson($response);
+        [$body, $kept] = $this->decodeJsonWithObjects($response);
         if ($status < 200 || $status >= 300) {
             throw $this->mapVendorError($status, $body, $response);
         }
 
-        return $this->parseResult($this->requireDecodedBody($body, $status), $input->model);
+        $json = $this->requireDecodedBody($body, $status);
+        // A prompt-level safety block legitimately carries no `candidates` — only
+        // `promptFeedback.blockReason`, which parseResult reports as content_filter.
+        $pf = $json['promptFeedback'] ?? null;
+        $promptBlocked = is_array($pf) && ($pf['blockReason'] ?? null) !== null && $pf['blockReason'] !== '';
+        if (!$promptBlocked && !is_array($json['candidates'] ?? null)) {
+            throw $this->missingPayloadError('candidates', $json, $status);
+        }
+
+        return $this->parseResult($json, $kept, $input->model);
     }
 
     public function stream(ChatInput $input): \Generator
     {
         $req = $this->buildRequest($input);
-        $url = $this->baseUrl . '/models/' . rawurlencode($input->model) . ':streamGenerateContent?alt=sse';
+        $url = self::appendQuery(
+            $this->baseUrl . '/models/' . rawurlencode($input->model) . ':streamGenerateContent',
+            array_merge(['alt' => 'sse'], $req['query']),
+        );
         $headers = array_merge($req['headers'], ['Accept' => 'text/event-stream']);
         $response = $this->sendPostJson($url, $req['body'], $headers);
 
@@ -85,17 +111,18 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
             throw $this->mapVendorError($status, $this->decodeJson($response), $response);
         }
 
+        $this->requireEventStream($response);
         $sawFunctionCall = false;
         $promptBlocked = false;
         $toolIndex = 0;
         $latestFinishRaw = null;
         $latestUsageMeta = null;
         $trailerRaw = null;
-        foreach ($this->parseSSEStream($response->getBody()) as $chunk) {
+        foreach ($this->parseSSEStreamWithObjects($response->getBody()) as [$chunk, $keptChunk]) {
             // A provider error emitted mid-stream arrives as an `{"error": …}` frame —
             // throw instead of silently ending the stream with no finishReason.
             if (($chunk['error'] ?? null) !== null) {
-                throw $this->streamError($chunk);
+                throw $this->streamError($chunk, $status);
             }
 
             $cand = (is_array($chunk['candidates'] ?? null) ? ($chunk['candidates'][0] ?? null) : null);
@@ -113,7 +140,7 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
             $content = is_array($cand['content'] ?? null) ? $cand['content'] : [];
             $parts = is_array($content['parts'] ?? null) ? $content['parts'] : [];
 
-            foreach ($parts as $p) {
+            foreach ($parts as $partIndex => $p) {
                 if (!is_array($p)) {
                     continue;
                 }
@@ -128,15 +155,18 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
                     $fc = $p['functionCall'];
                     $sawFunctionCall = true;
                     $name = is_string($fc['name'] ?? null) ? $fc['name'] : '';
-                    $id = is_string($fc['id'] ?? null) ? $fc['id'] : "call_{$name}";
                     // Monotonic index so parallel/multiple calls are never merged
-                    // by a consumer aggregating deltas by index.
+                    // by a consumer aggregating deltas by index; the synthetic id is
+                    // index-based for the same reason (two calls to one function
+                    // must not share an id).
+                    $index = $toolIndex++;
                     yield new ChatStreamDelta(
                         toolCallDelta: new ToolCallDelta(
-                            index: $toolIndex++,
-                            id: $id,
+                            index: $index,
+                            id: self::callId($fc, $index),
                             functionName: $name,
-                            argumentsDelta: $this->encodeJson($fc['args'] ?? []),
+                            argumentsDelta: $this->encodeJson(self::pick($keptChunk, 'candidates', 0, 'content', 'parts', $partIndex, 'functionCall', 'args') ?? $fc['args'] ?? []),
+                            providerMetadata: self::signatureMetadata($p),
                         ),
                         raw: $chunk,
                     );
@@ -159,22 +189,72 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
             }
         }
 
-        if ($latestFinishRaw !== null || $latestUsageMeta !== null || $promptBlocked) {
-            $finish = match (true) {
-                $sawFunctionCall => FinishReason::ToolCalls,
-                $latestFinishRaw === null && $promptBlocked => FinishReason::ContentFilter,
-                default => $this->mapFinishReason(is_string($latestFinishRaw) ? $latestFinishRaw : null),
-            };
-            yield new ChatStreamDelta(
-                finishReason: $finish,
-                usage: $latestUsageMeta !== null ? $this->mapUsage($latestUsageMeta) : null,
-                raw: $trailerRaw,
-            );
+        // A complete stream ends on a chunk carrying `finishReason` (or, for a
+        // blocked prompt, `promptFeedback.blockReason`); without one the answer
+        // was cut off.
+        if ($latestFinishRaw === null && !$promptBlocked) {
+            throw $this->streamEndedEarlyError();
         }
+
+        $finish = match (true) {
+            $sawFunctionCall => FinishReason::ToolCalls,
+            // Past the guard above, no finishReason means a blocked prompt.
+            $latestFinishRaw === null => FinishReason::ContentFilter,
+            default => $this->mapFinishReason(is_string($latestFinishRaw) ? $latestFinishRaw : null),
+        };
+        yield new ChatStreamDelta(
+            finishReason: $finish,
+            usage: $latestUsageMeta !== null ? $this->mapUsage($latestUsageMeta) : null,
+            raw: $trailerRaw,
+        );
     }
 
     /**
-     * @return array{body:array<string,mixed>,headers:array<string,string>}
+     * Gemini's own `functionCall.id` when it sent one, else an index-based id
+     * unique within the response.
+     *
+     * @param array<mixed> $fc
+     */
+    private static function callId(array $fc, int $index): string
+    {
+        return is_string($fc['id'] ?? null) && $fc['id'] !== '' ? $fc['id'] : "call_{$index}";
+    }
+
+    /**
+     * The part's `thoughtSignature` as ToolCall metadata, or null when it has none
+     * (Gemini signs only the first of several parallel calls).
+     *
+     * @param array<mixed> $part
+     *
+     * @return array<string,mixed>|null
+     */
+    private static function signatureMetadata(array $part): ?array
+    {
+        $sig = $part['thoughtSignature'] ?? null;
+
+        return is_string($sig) && $sig !== '' ? ['gemini' => ['thoughtSignature' => $sig]] : null;
+    }
+
+    private static function storedSignature(ToolCall $tc): ?string
+    {
+        $gemini = $tc->providerMetadata['gemini'] ?? null;
+        $sig = is_array($gemini) ? ($gemini['thoughtSignature'] ?? null) : null;
+
+        return is_string($sig) && $sig !== '' ? $sig : null;
+    }
+
+    /**
+     * Whether a tool-call id can be echoed as `functionCall.id` /
+     * `functionResponse.id`. The connector's own `call_N` stand-ins are not ids
+     * Gemini issued, so they stay off the wire and the call is matched by name.
+     */
+    private static function isEchoableId(?string $id): bool
+    {
+        return $id !== null && $id !== '' && preg_match(self::SYNTHETIC_ID, $id) !== 1;
+    }
+
+    /**
+     * @return array{body:array<string,mixed>,headers:array<string,string>,query:array<string,mixed>}
      */
     private function buildRequest(ChatInput $input): array
     {
@@ -190,8 +270,10 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
                 if ($t->function->description !== null) {
                     $d['description'] = $t->function->description;
                 }
+                // `parametersJsonSchema` takes real JSON Schema; `parameters` takes
+                // Google's OpenAPI subset and 400s on `additionalProperties`.
                 if ($t->function->parameters !== null) {
-                    $d['parameters'] = $t->function->parameters;
+                    $d['parametersJsonSchema'] = $t->function->parameters;
                 }
 
                 return $d;
@@ -229,8 +311,9 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
         if (is_array($ptBody)) {
             $body = array_merge($body, $ptBody);
         }
+        $ptQuery = $input->_passthrough['query'] ?? null;
 
-        return ['body' => $body, 'headers' => $this->buildHeaders($input)];
+        return ['body' => $body, 'headers' => $this->buildHeaders($input), 'query' => is_array($ptQuery) ? $ptQuery : []];
     }
 
     /**
@@ -257,18 +340,18 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
      */
     private function splitMessages(array $messages): array
     {
+        // Filled as the history is walked, so a tool result resolves against the
+        // nearest preceding call: synthetic `call_N` ids repeat across turns.
         $nameById = [];
+        $systemParts = [];
+        $contents = [];
         foreach ($messages as $m) {
             if ($m->role === ChatRole::Assistant && $m->toolCalls !== null) {
                 foreach ($m->toolCalls as $tc) {
                     $nameById[$tc->id] = $tc->function->name;
                 }
             }
-        }
 
-        $systemParts = [];
-        $contents = [];
-        foreach ($messages as $m) {
             if ($m->role === ChatRole::System) {
                 $t = $this->contentToText($m->content);
                 if ($t !== '') {
@@ -280,7 +363,11 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
 
             if ($m->role === ChatRole::Tool) {
                 $name = $m->name ?? ($m->toolCallId !== null ? ($nameById[$m->toolCallId] ?? $m->toolCallId) : 'tool');
-                $part = ['functionResponse' => ['name' => $name, 'response' => ['result' => $this->parseJsonOrString($this->contentToText($m->content))]]];
+                $response = ['name' => $name, 'response' => ['result' => $this->parseJsonOrString($this->contentToText($m->content))]];
+                if (self::isEchoableId($m->toolCallId)) {
+                    $response['id'] = $m->toolCallId;
+                }
+                $part = ['functionResponse' => $response];
                 $last = count($contents) - 1;
                 if ($last >= 0 && $contents[$last]['role'] === 'user' && $this->isFunctionResponseParts($contents[$last]['parts'])) {
                     $prev = $contents[$last];
@@ -331,9 +418,26 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
             }
         }
 
-        if ($m->role === ChatRole::Assistant && $m->toolCalls !== null) {
+        if ($m->role === ChatRole::Assistant && $m->toolCalls !== null && $m->toolCalls !== []) {
+            $first = count($parts);
+            $signed = false;
             foreach ($m->toolCalls as $tc) {
-                $parts[] = ['functionCall' => ['name' => $tc->function->name, 'args' => $this->safeJsonParse($tc->function->arguments)]];
+                $call = ['name' => $tc->function->name, 'args' => $this->safeJsonParse($tc->function->arguments)];
+                if (self::isEchoableId($tc->id)) {
+                    $call['id'] = $tc->id;
+                }
+                $part = ['functionCall' => $call];
+                $sig = self::storedSignature($tc);
+                if ($sig !== null) {
+                    $part['thoughtSignature'] = $sig;
+                    $signed = true;
+                }
+                $parts[] = $part;
+            }
+            // Gemini signs only the first call of a parallel batch, so one real
+            // signature anywhere means the turn came from Gemini intact.
+            if (!$signed) {
+                $parts[$first]['thoughtSignature'] = self::SKIP_SIGNATURE;
             }
         }
 
@@ -401,16 +505,19 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
             $gen['responseMimeType'] = 'application/json';
         } elseif ($rf->type === 'json_schema') {
             $gen['responseMimeType'] = 'application/json';
+            // JSON Schema proper; the deprecated `responseSchema` takes only
+            // Google's OpenAPI subset.
             if ($rf->schema !== null) {
-                $gen['responseSchema'] = $rf->schema;
+                $gen['responseJsonSchema'] = $rf->schema;
             }
         }
     }
 
     /**
-     * @param array<mixed> $json
+     * @param array<mixed>      $json plain decode: read here and kept as `raw`
+     * @param array<mixed>|null $kept the same body with objects preserved, for the arguments
      */
-    private function parseResult(array $json, string $requestedModel): ChatResult
+    private function parseResult(array $json, ?array $kept, string $requestedModel): ChatResult
     {
         $cand = (is_array($json['candidates'] ?? null) ? ($json['candidates'][0] ?? null) : null);
         $cand = is_array($cand) ? $cand : [];
@@ -419,8 +526,7 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
 
         $text = '';
         $toolCalls = [];
-        $idx = 0;
-        foreach ($parts as $p) {
+        foreach ($parts as $partIndex => $p) {
             if (!is_array($p)) {
                 continue;
             }
@@ -434,13 +540,13 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
             } elseif (is_array($p['functionCall'] ?? null)) {
                 $fc = $p['functionCall'];
                 $toolCalls[] = new ToolCall(
-                    id: is_string($fc['id'] ?? null) ? $fc['id'] : "call_{$idx}",
+                    id: self::callId($fc, count($toolCalls)),
                     function: new ToolCallFunction(
                         name: is_string($fc['name'] ?? null) ? $fc['name'] : '',
-                        arguments: $this->encodeJson($fc['args'] ?? []),
+                        arguments: $this->encodeJson(self::pick($kept, 'candidates', 0, 'content', 'parts', $partIndex, 'functionCall', 'args') ?? $fc['args'] ?? []),
                     ),
+                    providerMetadata: self::signatureMetadata($p),
                 );
-                $idx++;
             }
         }
 
@@ -479,19 +585,30 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
      */
     private function mapUsage(?array $u): Usage
     {
-        $in = is_int($u['promptTokenCount'] ?? null) ? $u['promptTokenCount'] : 0;
-        $out = is_int($u['candidatesTokenCount'] ?? null) ? $u['candidatesTokenCount'] : 0;
-        $total = is_int($u['totalTokenCount'] ?? null) ? $u['totalTokenCount'] : $in + $out;
+        // Tool-use prompt tokens are billed input, and thoughts billed output,
+        // though Gemini reports both apart from the prompt and the candidates.
+        // Summing both sides keeps total = input + output, as Gemini's own
+        // totalTokenCount is.
+        $in = (is_int($u['promptTokenCount'] ?? null) ? $u['promptTokenCount'] : 0)
+            + (is_int($u['toolUsePromptTokenCount'] ?? null) ? $u['toolUsePromptTokenCount'] : 0);
+        $out = (is_int($u['candidatesTokenCount'] ?? null) ? $u['candidatesTokenCount'] : 0)
+            + (is_int($u['thoughtsTokenCount'] ?? null) ? $u['thoughtsTokenCount'] : 0);
 
-        return new Usage($in, $out, $total);
+        return new Usage($in, $out, $in + $out);
     }
 
     private function mapFinishReason(?string $fr): FinishReason
     {
         return match ($fr) {
             'STOP' => FinishReason::Stop,
-            'MAX_TOKENS' => FinishReason::Length,
-            'SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII' => FinishReason::ContentFilter,
+            // CONTINUATION: the per-request token limit cut the answer short.
+            'MAX_TOKENS', 'CONTINUATION' => FinishReason::Length,
+            'SAFETY', 'RECITATION', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII',
+            'IMAGE_SAFETY', 'IMAGE_PROHIBITED_CONTENT', 'IMAGE_RECITATION' => FinishReason::ContentFilter,
+            // The rest of google-genai's FinishReason enum (LANGUAGE,
+            // MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL, TOO_MANY_TOOL_CALLS,
+            // NO_IMAGE, IMAGE_OTHER, OTHER, FINISH_REASON_UNSPECIFIED) has no
+            // normalized equivalent; the raw value stays on `raw`.
             default => FinishReason::Unknown,
         };
     }
@@ -553,7 +670,7 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
         }
 
         return new ConnectorError(
-            providerCode: $this->mapStatusToProviderCode($status, $message),
+            providerCode: $this->mapStatusToProviderCode($status, $message, $body),
             providerMessage: $message,
             cause: ['raw' => $body, 'retryAfter' => $retryAfter, 'retryAfterSeconds' => $seconds],
             statusCode: $status,
@@ -561,25 +678,51 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
     }
 
     /**
-     * Builds a ConnectorError from a mid-stream `{"error": …}` frame, reusing the
-     * non-stream error mapping (Gemini's `error.code` IS the HTTP status).
+     * Builds a ConnectorError from a mid-stream `{"error": …}` frame. The code
+     * comes from the frame's `error.code` (an HTTP status) or, failing that, its
+     * `error.status` name, classified as the non-stream path would; `statusCode`
+     * stays the status the stream arrived with, since no other was ever sent.
+     * A frame with neither is `unknown`.
      *
      * @param array<mixed> $chunk
      */
-    private function streamError(array $chunk): ConnectorError
+    private function streamError(array $chunk, int $arrivalStatus): ConnectorError
     {
         $error = $chunk['error'] ?? null;
-        $status = (is_array($error) && is_int($error['code'] ?? null) && $error['code'] >= 400 && $error['code'] <= 599)
-            ? $error['code']
-            : 500;
-        $message = $this->extractError($chunk) ?? "HTTP {$status}";
+        $frameStatus = null;
+        if (is_array($error)) {
+            $frameStatus = is_int($error['code'] ?? null) && $error['code'] >= 400 && $error['code'] <= 599
+                ? $error['code']
+                : self::rpcStatus($error['status'] ?? null);
+        }
+        $message = $this->extractError($chunk) ?? 'Stream error';
+        $code = $frameStatus === null && self::errorReason($chunk) !== 'API_KEY_INVALID'
+            ? ProviderCode::Unknown
+            : $this->mapStatusToProviderCode($frameStatus ?? 400, $message, $chunk);
 
         return new ConnectorError(
-            providerCode: $this->mapStatusToProviderCode($status, $message),
+            providerCode: $code,
             providerMessage: $message,
             cause: ['raw' => $chunk, 'retryAfter' => null, 'retryAfterSeconds' => $this->extractRetryDelaySeconds($chunk)],
-            statusCode: $status,
+            statusCode: $arrivalStatus,
         );
+    }
+
+    /** HTTP status for a `google.rpc.Code` name, per Google's error-model mapping. */
+    private static function rpcStatus(mixed $name): ?int
+    {
+        return match ($name) {
+            'INVALID_ARGUMENT', 'FAILED_PRECONDITION', 'OUT_OF_RANGE' => 400,
+            'UNAUTHENTICATED' => 401,
+            'PERMISSION_DENIED' => 403,
+            'NOT_FOUND' => 404,
+            'RESOURCE_EXHAUSTED' => 429,
+            'INTERNAL', 'UNKNOWN', 'DATA_LOSS' => 500,
+            'UNIMPLEMENTED' => 501,
+            'UNAVAILABLE' => 503,
+            'DEADLINE_EXCEEDED' => 504,
+            default => null,
+        };
     }
 
     /**
@@ -620,26 +763,59 @@ final class GeminiConnector extends BaseConnector implements ChatConnectorInterf
         return is_string($body['message'] ?? null) ? $body['message'] : null;
     }
 
-    private function mapStatusToProviderCode(int $status, string $message): ProviderCode
+    /**
+     * @param array<mixed>|null $body
+     */
+    private function mapStatusToProviderCode(int $status, string $message, ?array $body): ProviderCode
     {
-        if ($status === 401 || $status === 403) {
+        if ($status === 401 || $status === 403 || self::errorReason($body) === 'API_KEY_INVALID') {
+            // A bad key is a 400 INVALID_ARGUMENT whose ErrorInfo reason is
+            // API_KEY_INVALID, not a 401.
             return ProviderCode::AuthFailed;
         }
-        if ($status === 429) {
+        // 402 is exhausted credit or quota, which OpenAI (429 insufficient_quota)
+        // and Gemini (RESOURCE_EXHAUSTED) already report as rate limiting.
+        if ($status === 429 || $status === 402) {
             return ProviderCode::RateLimited;
         }
-        if ($status >= 500) {
+        // 408 is a timeout; Gemini's troubleshooting guide says to retry it.
+        if ($status >= 500 || $status === 408) {
             return ProviderCode::ProviderUnavailable;
         }
-        if ($status === 400 || $status === 404 || $status === 422) {
+        if ($status === 400) {
+            // "The input token count (N) exceeds the maximum number of tokens
+            // allowed (M)." A looser 'context' match would catch ordinary 400s
+            // (cachedContent errors) and loop history-trimming callers.
             $m = strtolower($message);
-            if (str_contains($m, 'too long') || str_contains($m, 'context') || str_contains($m, 'token count')) {
+            if (str_contains($m, 'exceeds the maximum number of tokens')) {
                 return ProviderCode::ContextLengthExceeded;
             }
-
+        }
+        if ($status >= 400) {
             return ProviderCode::InvalidRequest;
         }
 
         return ProviderCode::Unknown;
+    }
+
+    /**
+     * The `reason` of the `google.rpc.ErrorInfo` entry in `error.details`.
+     *
+     * @param array<mixed>|null $body
+     */
+    private static function errorReason(?array $body): ?string
+    {
+        $error = $body['error'] ?? null;
+        $details = is_array($error) ? ($error['details'] ?? null) : null;
+        if (!is_array($details)) {
+            return null;
+        }
+        foreach ($details as $d) {
+            if (is_array($d) && is_string($d['reason'] ?? null)) {
+                return $d['reason'];
+            }
+        }
+
+        return null;
     }
 }

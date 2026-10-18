@@ -27,12 +27,14 @@ final readonly class OpenAiCompatSpec
         public ?string $streamUsagePath = null,
         /** true ⇒ provider rejects unknown params (Mistral 422) — skip stream_options. */
         public bool $strictParams = false,
+        /** Vendor field for the embeddings output size — Mistral calls it `output_dimension`. */
+        public string $dimensionsField = 'dimensions',
     ) {}
 
     /**
      * @return array<string,string>
      */
-    public function buildAuthHeaders(OpenAiCompatConfig $config): array
+    public function buildAuthHeaders(#[\SensitiveParameter] OpenAiCompatConfig $config): array
     {
         if ($config->apiKey === null || $config->apiKey === '') {
             return [];

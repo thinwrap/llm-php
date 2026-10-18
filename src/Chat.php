@@ -34,6 +34,7 @@ final class Chat implements ChatConnectorInterface
 
     public function __construct(
         public readonly ?LlmProviderId $providerId,
+        #[\SensitiveParameter]
         OpenAiCompatConfig|AnthropicConfig|BedrockConfig|GeminiConfig|null $config = null,
         ?ClientInterface $client = null,
         ?RequestFactoryInterface $requestFactory = null,
@@ -89,6 +90,7 @@ final class Chat implements ChatConnectorInterface
 
     private function buildOpenAiCompat(
         LlmProviderId $providerId,
+        #[\SensitiveParameter]
         OpenAiCompatConfig|AnthropicConfig|BedrockConfig|GeminiConfig $config,
         ?ClientInterface $client,
         ?RequestFactoryInterface $requestFactory,

@@ -3,23 +3,22 @@ name: Publish to Packagist
 # Packagist publish + cosign-signed GitHub Release artifact.
 #
 # Unlike npm OIDC trusted publishing, Packagist does NOT pull from a publish
-# workflow. Packagist auto-discovers new tags via a GitHub-integration webhook
-# configured on the maintainer's Packagist account. The package itself must be
-# submitted once at packagist.org/packages/submit (a one-time manual step that
-# creates `thinwrap/llm` from composer.json); thereafter the webhook indexes
-# each published tag automatically.
+# workflow. Packagist discovers new tags through its GitHub hook, which fires
+# on the tag PUSH — so a pushed tag is indexed before, and regardless of, this
+# job. The checks below therefore gate the cosign signature, not publication;
+# keeping unreviewed tags off Packagist needs a tag ruleset on the repository.
 #
 # This workflow therefore does NOT push to a package registry. Instead it:
 #   1. Verifies the tag matches `v*` (the trigger is `release: published`).
-#   2. Signs the release source archive via cosign keyless OIDC (no static
-#      key) for attestable provenance — PHP analogue of npm Sigstore
-#      provenance.
-#   3. Attaches the cosign signature + certificate as Release assets so
-#      consumers can run `cosign verify-blob` post-install.
+#   2. Builds the source archive from the verified commit (`git archive`) and
+#      signs it via cosign keyless OIDC (no static key) for attestable
+#      provenance — PHP analogue of npm Sigstore provenance.
+#   3. Attaches that archive plus the cosign signature + certificate as Release
+#      assets so consumers can run `cosign verify-blob` on the signed bytes.
 #
-# Trigger: `release: types: [published]` only — prevents accidental publishes
-# from feature branches. By convention GitHub Releases are cut from tags on
-# `main`.
+# Trigger: `release: types: [published]` only. Branch protection does not
+# cover tags and a Release can be cut from a tag on any commit, so the job
+# refuses to sign unless the tagged commit is on `main`.
 #
 # `id-token: write` is required for the cosign keyless OIDC token exchange
 # with sigstore. No PACKAGIST_TOKEN secret is consumed — long-lived Packagist
@@ -44,11 +43,19 @@ jobs:
   cosign-sign-and-attach:
     name: Cosign-sign release archive and attach to GitHub Release
     runs-on: ubuntu-latest
+    env:
+      # The tag name is user-controlled: scripts read it from the environment
+      # rather than having it expanded inline, which would allow injection.
+      TAG: ${{ github.event.release.tag_name }}
     steps:
       - name: Checkout release tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0    # full history for the on-main ancestry check
+          # Nothing here pushes with git (the upload uses GH_TOKEN), so the
+          # token is not left in .git/config for later steps.
+          persist-credentials: false
 
       - name: Verify tag matches v* pattern
         # Defence-in-depth: even though the workflow only triggers on
@@ -57,26 +64,34 @@ jobs:
         # `nightly-*` or `rc-*` tagged releases that should not ship to
         # Packagist.
         run: |
-          tag="${{ github.event.release.tag_name }}"
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release tag '$tag' does not match v<major>.<minor>.<patch>; refusing to sign."
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag '$TAG' does not match v<major>.<minor>.<patch>; refusing to sign."
             exit 1
           fi
-          echo "Signing release for tag: $tag"
+          echo "Signing release for tag: $TAG"
 
-      - name: Download release source archive
-        # GitHub auto-generates a `.tar.gz` source archive for every release
-        # tag. We sign that archive (the same artifact consumers could download
-        # from the Release page); Packagist itself fetches from the tag, not
-        # from this archive, but consumers who want offline provenance
-        # verification can grab archive + cosign.sig + cosign.pem from the
-        # Release page and run cosign verify-blob.
+      - name: Verify the tagged commit is on main
+        # Tags bypass branch protection; without this, a tag on any commit
+        # (for example on an unmerged branch) would be signed and released.
         run: |
-          tag="${{ github.event.release.tag_name }}"
-          repo="${{ github.repository }}"
-          curl -sSL -o "source-${tag}.tar.gz" \
-            "https://github.com/${repo}/archive/refs/tags/${tag}.tar.gz"
-          ls -la "source-${tag}.tar.gz"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tagged commit $GITHUB_SHA is not on main; refusing to sign."
+            exit 1
+          fi
+          echo "Tagged commit $GITHUB_SHA is on main."
+
+      - name: Build source archive from the verified commit
+        # Built locally from $GITHUB_SHA — the commit the ancestry check above
+        # verified — rather than downloaded by tag name, which a tag moved
+        # between the two steps would point elsewhere. `git archive` honours
+        # .gitattributes export-ignore, so this is the same file set Packagist
+        # ships. The archive is uploaded next to its signature, so consumers
+        # verify exactly the bytes that were signed.
+        run: |
+          git archive --format=tar.gz --prefix="llm-php-${TAG#v}/" \
+            -o "source-${TAG}.tar.gz" "$GITHUB_SHA"
+          ls -la "source-${TAG}.tar.gz"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
@@ -100,29 +115,26 @@ jobs:
         env:
           COSIGN_EXPERIMENTAL: '1'
         run: |
-          tag="${{ github.event.release.tag_name }}"
-          archive="source-${tag}.tar.gz"
+          archive="source-${TAG}.tar.gz"
           cosign sign-blob --yes \
             --output-signature "cosign.sig" \
             --output-certificate "cosign.pem" \
             "$archive"
           ls -la cosign.sig cosign.pem
 
-      - name: Upload cosign signature + certificate to GitHub Release
+      - name: Upload signed archive, signature + certificate to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ github.event.release.tag_name }}"
-          gh release upload "$tag" cosign.sig cosign.pem --clobber
+          gh release upload "$TAG" "source-${TAG}.tar.gz" cosign.sig cosign.pem --clobber
 
       - name: Print Packagist auto-discovery reminder
         # Packagist auto-discovers new tags via the GitHub-integration webhook
         # on the maintainer's Packagist account. This step prints a reminder so
         # a release operator knows to monitor Packagist post-tag.
         run: |
-          tag="${{ github.event.release.tag_name }}"
           cat <<EOF
-          Cosign signature attached to release $tag.
+          Cosign signature attached to release $TAG.
 
           Packagist auto-discovery should fire within minutes via the
           GitHub-integration webhook. To verify:

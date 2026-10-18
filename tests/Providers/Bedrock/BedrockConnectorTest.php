@@ -57,7 +57,7 @@ final class BedrockConnectorTest extends TestCase
         ]));
 
         $res = $this->connector()->complete(new ChatInput(
-            model: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
+            model: 'anthropic.claude-haiku-4-5-20251001-v1:0',
             messages: [new ChatMessage(ChatRole::System, 'be brief'), new ChatMessage(ChatRole::User, 'hi')],
             maxOutputTokens: 50,
         ));
@@ -68,7 +68,7 @@ final class BedrockConnectorTest extends TestCase
 
         $req = $this->mock->getRequests()[0];
         self::assertSame(
-            'https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse',
+            'https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-haiku-4-5-20251001-v1%3A0/converse',
             (string) $req->getUri(),
         );
 
@@ -94,14 +94,14 @@ final class BedrockConnectorTest extends TestCase
             'usage' => [],
         ]));
 
-        $model = 'anthropic.claude-3-5-sonnet-20241022-v2:0';
+        $model = 'anthropic.claude-haiku-4-5-20251001-v1:0';
         $this->connector()->complete(new ChatInput(model: $model, messages: [new ChatMessage(ChatRole::User, 'hi')]));
 
         $req = $this->mock->getRequests()[0];
 
         // The WIRE path is SINGLE-encoded: `:` → `%3A`, and never `%253A`.
         $uri = (string) $req->getUri();
-        self::assertStringContainsString('anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse', $uri);
+        self::assertStringContainsString('anthropic.claude-haiku-4-5-20251001-v1%3A0/converse', $uri);
         self::assertStringNotContainsString('%253A', $uri);
 
         // The SIGNED canonical URI must be DOUBLE-encoded (`%253A`) — and therefore
@@ -139,7 +139,7 @@ final class BedrockConnectorTest extends TestCase
      * for the default no-session connector (signed headers:
      * content-type;host;x-amz-content-sha256;x-amz-date).
      */
-    private function recomputeSignature(string $canonicalPath, string $timestamp, string $hashedPayload): string
+    private function recomputeSignature(string $canonicalPath, string $timestamp, string $hashedPayload, string $canonicalQuery = '', string $contentType = 'application/json'): string
     {
         $host = 'bedrock-runtime.us-east-1.amazonaws.com';
         $region = 'us-east-1';
@@ -147,13 +147,13 @@ final class BedrockConnectorTest extends TestCase
         $secret = 'secret';
 
         $canonicalHeaders
-            = "content-type:application/json\n"
+            = "content-type:{$contentType}\n"
             . "host:{$host}\n"
             . "x-amz-content-sha256:{$hashedPayload}\n"
             . "x-amz-date:{$timestamp}\n";
         $signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date';
 
-        $canonicalRequest = "POST\n{$canonicalPath}\n\n{$canonicalHeaders}\n{$signedHeaders}\n{$hashedPayload}";
+        $canonicalRequest = "POST\n{$canonicalPath}\n{$canonicalQuery}\n{$canonicalHeaders}\n{$signedHeaders}\n{$hashedPayload}";
 
         $dateStamp = substr($timestamp, 0, 8);
         $scope = "{$dateStamp}/{$region}/{$service}/aws4_request";
@@ -281,5 +281,214 @@ final class BedrockConnectorTest extends TestCase
         $uri = (string) $this->mock->getRequests()[0]->getUri();
         self::assertStringContainsString('/converse', $uri);
         self::assertStringNotContainsString('converse-stream', $uri);
+    }
+
+    public function testHttp200WithoutPayloadThrows(): void
+    {
+        $this->mock->addResponse($this->json(200, []));
+
+        try {
+            $this->connector()->complete(new ChatInput(model: 'anthropic.claude-3-haiku-20240307-v1:0', messages: [new ChatMessage(ChatRole::User, 'hi')]));
+            self::fail('expected ConnectorError');
+        } catch (ConnectorError $e) {
+            self::assertSame(ProviderCode::ProviderUnavailable, $e->providerCode);
+            self::assertSame(200, $e->statusCode);
+        }
+    }
+
+    /**
+     * @return array{0:string,1:string}
+     */
+    private function signatureOf(int $request = 0): array
+    {
+        $req = $this->mock->getRequests()[$request];
+        self::assertSame(1, preg_match('/Signature=([0-9a-f]{64})$/', $req->getHeaderLine('Authorization'), $m));
+
+        return [$m[1], $req->getHeaderLine('X-Amz-Date')];
+    }
+
+    private function okBody(): Response
+    {
+        return $this->json(200, ['output' => ['message' => ['content' => [['text' => 'ok']]]], 'stopReason' => 'end_turn', 'usage' => []]);
+    }
+
+    public function testPassthroughQueryIsSentAndSigned(): void
+    {
+        $this->mock->addResponse($this->okBody());
+        $this->connector()->complete(new ChatInput(
+            model: 'm',
+            messages: [new ChatMessage(ChatRole::User, 'hi')],
+            _passthrough: ['query' => ['z' => 'last', 'a' => 'x y']],
+        ));
+
+        $req = $this->mock->getRequests()[0];
+        self::assertSame('https://bedrock-runtime.us-east-1.amazonaws.com/model/m/converse?a=x%20y&z=last', (string) $req->getUri());
+        [$signature, $timestamp] = $this->signatureOf();
+        self::assertSame(
+            $this->recomputeSignature('/model/m/converse', $timestamp, $req->getHeaderLine('X-Amz-Content-Sha256'), 'a=x%20y&z=last'),
+            $signature,
+        );
+    }
+
+    public function testCaseVariantDuplicateHeaderIsSignedWithTheValueSent(): void
+    {
+        $this->mock->addResponse($this->okBody());
+        $this->connector()->complete(new ChatInput(
+            model: 'm',
+            messages: [new ChatMessage(ChatRole::User, 'hi')],
+            _passthrough: ['headers' => ['content-type' => 'application/json; charset=utf-8']],
+        ));
+
+        $req = $this->mock->getRequests()[0];
+        self::assertSame(['application/json; charset=utf-8'], $req->getHeader('Content-Type'));
+        [$signature, $timestamp] = $this->signatureOf();
+        self::assertSame(
+            $this->recomputeSignature('/model/m/converse', $timestamp, $req->getHeaderLine('X-Amz-Content-Sha256'), '', 'application/json; charset=utf-8'),
+            $signature,
+        );
+    }
+
+    public function testRegionMustBeAHostLabel(): void
+    {
+        foreach (['evil.com/x', 'us-east-1.evil.com', 'US EAST', '', 'us-east-1#'] as $region) {
+            try {
+                new BedrockConnector(new BedrockConfig(region: $region, accessKeyId: 'AKIA', secretAccessKey: 's'), $this->mock, $this->factory, $this->factory);
+                self::fail("expected ConnectorError for '{$region}'");
+            } catch (ConnectorError $e) {
+                self::assertSame(ProviderCode::InvalidRequest, $e->providerCode);
+            }
+        }
+    }
+
+    public function testToolChoiceNoneOmitsToolConfig(): void
+    {
+        $this->mock->addResponse($this->okBody());
+        $this->connector()->complete(new ChatInput(
+            model: 'm',
+            messages: [new ChatMessage(ChatRole::User, 'hi')],
+            tools: [new ToolDefinition(new ToolFunction('get_weather'))],
+            toolChoice: 'none',
+        ));
+
+        /** @var array<string,mixed> $sent */
+        $sent = json_decode((string) $this->mock->getRequests()[0]->getBody(), true, 512, JSON_THROW_ON_ERROR);
+        self::assertArrayNotHasKey('toolConfig', $sent);
+    }
+
+    public function testUsageCountsCacheReadsAndWritesAsInput(): void
+    {
+        $this->mock->addResponse($this->json(200, [
+            'output' => ['message' => ['content' => [['text' => 'ok']]]],
+            'stopReason' => 'end_turn',
+            'usage' => ['inputTokens' => 4, 'cacheReadInputTokens' => 500, 'cacheWriteInputTokens' => 100, 'outputTokens' => 6, 'totalTokens' => 610],
+        ]));
+
+        $res = $this->connector()->complete(new ChatInput(model: 'm', messages: [new ChatMessage(ChatRole::User, 'hi')]));
+        self::assertSame(604, $res->usage->inputTokens);
+        self::assertSame(6, $res->usage->outputTokens);
+        self::assertSame(610, $res->usage->totalTokens);
+    }
+
+    public function testStopReasonsAndStatusGaps(): void
+    {
+        $this->mock->addResponse($this->json(200, ['output' => ['message' => ['content' => [['text' => 'x']]]], 'stopReason' => 'model_context_window_exceeded', 'usage' => []]));
+        $res = $this->connector()->complete(new ChatInput(model: 'm', messages: [new ChatMessage(ChatRole::User, 'hi')]));
+        self::assertSame(FinishReason::Length, $res->finishReason);
+
+        $this->mock->addResponse($this->json(200, ['output' => ['message' => ['content' => [['text' => 'x']]]], 'stopReason' => 'malformed_tool_use', 'usage' => []]));
+        $res = $this->connector()->complete(new ChatInput(model: 'm', messages: [new ChatMessage(ChatRole::User, 'hi')]));
+        self::assertSame(FinishReason::Unknown, $res->finishReason);
+
+        $cases = [
+            [408, 'Model timed out', ProviderCode::ProviderUnavailable],
+            [424, 'Model error', ProviderCode::ProviderUnavailable],
+            [400, 'Input is too long for requested model.', ProviderCode::ContextLengthExceeded],
+            [400, 'The model name is too long', ProviderCode::InvalidRequest],
+            [413, 'Payload too large', ProviderCode::InvalidRequest],
+            [402, 'Payment required', ProviderCode::RateLimited],
+        ];
+        foreach ($cases as [$status, $message, $expected]) {
+            $this->mock->addResponse($this->json($status, ['message' => $message]));
+            try {
+                $this->connector()->complete(new ChatInput(model: 'm', messages: [new ChatMessage(ChatRole::User, 'hi')]));
+                self::fail('expected ConnectorError');
+            } catch (ConnectorError $e) {
+                self::assertSame($expected, $e->providerCode, "{$status} {$message}");
+            }
+        }
+    }
+
+    public function testRegionRegexRejectsDoubleHyphens(): void
+    {
+        foreach (['us--east-1', '-us-east-1', 'us-east-1-'] as $region) {
+            try {
+                new BedrockConnector(new BedrockConfig(region: $region, accessKeyId: 'AKIA', secretAccessKey: 's'), $this->mock, $this->factory, $this->factory);
+                self::fail("expected ConnectorError for '{$region}'");
+            } catch (ConnectorError $e) {
+                self::assertSame(ProviderCode::InvalidRequest, $e->providerCode);
+            }
+        }
+        new BedrockConnector(new BedrockConfig(region: 'ap-southeast-7', accessKeyId: 'AKIA', secretAccessKey: 's'), $this->mock, $this->factory, $this->factory);
+        $this->addToAssertionCount(1);
+    }
+
+    public function testEmptyTextPartsAreDropped(): void
+    {
+        $this->mock->addResponse($this->okBody());
+        $this->connector()->complete(new ChatInput(model: 'm', messages: [new ChatMessage(ChatRole::User, [new \Thinwrap\Llm\DTO\Chat\TextPart(''), new \Thinwrap\Llm\DTO\Chat\TextPart('hi')])]));
+
+        /** @var array<string,mixed> $sent */
+        $sent = json_decode((string) $this->mock->getRequests()[0]->getBody(), true, 512, JSON_THROW_ON_ERROR);
+        self::assertSame([['text' => 'hi']], $sent['messages'][0]['content']);
+    }
+
+    public function testToolUseNestedEmptyObjectSurvivesInArguments(): void
+    {
+        $this->mock->addResponse(new Response(200, ['Content-Type' => 'application/json'], '{"output":{"message":{"content":[{"toolUse":{"toolUseId":"t","name":"f","input":{"o":{}}}}]}},"stopReason":"tool_use","usage":{}}'));
+        $res = $this->connector()->complete(new ChatInput(model: 'm', messages: [new ChatMessage(ChatRole::User, 'hi')]));
+        self::assertNotNull($res->message->toolCalls);
+        self::assertSame('{"o":{}}', $res->message->toolCalls[0]->function->arguments);
+    }
+
+    public function testOverflowPhrasesAreTheDocumentedOnes(): void
+    {
+        $cases = [
+            ['prompt is too long: 250000 tokens > 200000 maximum', ProviderCode::ContextLengthExceeded],
+            ["This model's maximum context length is 128000 tokens", ProviderCode::ContextLengthExceeded],
+            ['input length and `max_tokens` exceed context limit', ProviderCode::ContextLengthExceeded],
+            ['The context window setting is not supported', ProviderCode::InvalidRequest],
+        ];
+        foreach ($cases as [$message, $expected]) {
+            $this->mock->addResponse($this->json(400, ['message' => $message]));
+            try {
+                $this->connector()->complete(new ChatInput(model: 'm', messages: [new ChatMessage(ChatRole::User, 'hi')]));
+                self::fail('expected ConnectorError');
+            } catch (ConnectorError $e) {
+                self::assertSame($expected, $e->providerCode, $message);
+            }
+        }
+    }
+
+    public function testDebugOutputRedactsCredentials(): void
+    {
+        $config = new BedrockConfig(region: 'us-east-1', accessKeyId: 'AKIASECRET', secretAccessKey: 'SECRETKEY', sessionToken: 'SECRETTOKEN');
+        $connector = new BedrockConnector($config, $this->mock, $this->factory, $this->factory);
+        foreach ([$config, $connector] as $subject) {
+            self::assertStringNotContainsString('SECRET', print_r($subject, true));
+        }
+    }
+
+    public function testRawStaysPlainArraysWhileArgumentsKeepObjects(): void
+    {
+        $this->mock->addResponse(new Response(200, ['Content-Type' => 'application/json'], '{"output":{"message":{"content":[{"toolUse":{"toolUseId":"t","name":"f","input":{"o":{}}}}]}},"stopReason":"tool_use","usage":{},"metrics":{}}'));
+        $res = $this->connector()->complete(new ChatInput(model: 'm', messages: [new ChatMessage(ChatRole::User, 'hi')]));
+        self::assertIsArray($res->raw);
+        $raw = $res->raw;
+        array_walk_recursive($raw, static function (mixed $v): void {
+            self::assertIsNotObject($v);
+        });
+        self::assertStringNotContainsString('{}', json_encode($res->raw, JSON_THROW_ON_ERROR));
+        self::assertNotNull($res->message->toolCalls);
+        self::assertSame('{"o":{}}', $res->message->toolCalls[0]->function->arguments);
     }
 }
